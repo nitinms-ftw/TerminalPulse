@@ -1,19 +1,95 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, powerMonitor, dialog } = require("electron");
 const path = require("path");
-const { exec, execSync } = require("child_process");
+const { execFile } = require("child_process");
 const fs = require("fs");
 const os = require("os");
+const crypto = require("crypto");
 const Store = require("electron-store");
 const AutoLaunch = require("auto-launch");
 
-const store = new Store();
+// ─── FIX #3: Encrypted store ───
+const ENCRYPTION_KEY = "tp-" + os.hostname() + "-" + os.userInfo().username;
+const store = new Store({ encryptionKey: ENCRYPTION_KEY });
+
+// ─── FIX #4: Encrypted backups ───
+const BACKUP_ALGO = "aes-256-gcm";
+const BACKUP_KEY_SEED = "TerminalPulse-backup-" + os.userInfo().username;
+
+function deriveBackupKey() {
+  return crypto.scryptSync(BACKUP_KEY_SEED, "terminalpulse-salt", 32);
+}
+
+function encryptData(plaintext) {
+  const key = deriveBackupKey();
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(BACKUP_ALGO, key, iv);
+  let encrypted = cipher.update(plaintext, "utf-8", "hex");
+  encrypted += cipher.final("hex");
+  const tag = cipher.getAuthTag().toString("hex");
+  return JSON.stringify({ iv: iv.toString("hex"), tag, data: encrypted });
+}
+
+function decryptData(blob) {
+  const { iv, tag, data } = JSON.parse(blob);
+  const key = deriveBackupKey();
+  const decipher = crypto.createDecipheriv(BACKUP_ALGO, key, Buffer.from(iv, "hex"));
+  decipher.setAuthTag(Buffer.from(tag, "hex"));
+  let decrypted = decipher.update(data, "hex", "utf-8");
+  decrypted += decipher.final("utf-8");
+  return decrypted;
+}
+
+// ─── FIX #5: Whitelist allowed keys for backup import ───
+const ALLOWED_STORE_KEYS = new Set([
+  "totalSeconds", "dailyData", "achievements", "currentStreak", "longestStreak",
+  "level", "xp", "aiSeconds", "dailyAiData", "toolSeconds", "dailyToolData",
+  "projectSeconds", "dailyProjectData", "todayCommits", "totalCommits",
+  "dailyCommits", "activeTools", "autoLaunchConfigured",
+]);
+
+function validateBackupData(data) {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
+  const clean = {};
+  for (const [key, val] of Object.entries(data)) {
+    if (!ALLOWED_STORE_KEYS.has(key)) continue;
+    // Type validation
+    if (key === "totalSeconds" || key === "currentStreak" || key === "longestStreak" ||
+        key === "level" || key === "xp" || key === "aiSeconds" ||
+        key === "todayCommits" || key === "totalCommits") {
+      if (typeof val !== "number" || val < 0) continue;
+    }
+    if (key === "achievements") {
+      if (!Array.isArray(val)) continue;
+      if (!val.every(v => typeof v === "string" && v.length < 50)) continue;
+    }
+    if (key === "dailyData" || key === "dailyAiData" || key === "dailyCommits") {
+      if (typeof val !== "object" || val === null) continue;
+      // Validate date keys and numeric values
+      const valid = Object.entries(val).every(([k, v]) =>
+        /^\d{4}-\d{2}-\d{2}$/.test(k) && typeof v === "number" && v >= 0
+      );
+      if (!valid) continue;
+    }
+    if (key === "activeTools") {
+      if (!Array.isArray(val)) continue;
+      if (!val.every(v => typeof v === "string" && v.length < 100)) continue;
+    }
+    clean[key] = val;
+  }
+  return Object.keys(clean).length > 0 ? clean : null;
+}
 
 // ─── BACKUP SYSTEM ───
 const ICLOUD_PATH = path.join(os.homedir(), "Library/Mobile Documents/com~apple~CloudDocs/TerminalPulse");
 let backupInterval;
 
 function getBackupData() {
-  return JSON.stringify(store.store, null, 2);
+  const data = {};
+  for (const key of ALLOWED_STORE_KEYS) {
+    const val = store.get(key);
+    if (val !== undefined) data[key] = val;
+  }
+  return JSON.stringify(data, null, 2);
 }
 
 function autoBackupToICloud() {
@@ -22,17 +98,17 @@ function autoBackupToICloud() {
     if (!fs.existsSync(icloudBase)) return false;
     if (!fs.existsSync(ICLOUD_PATH)) fs.mkdirSync(ICLOUD_PATH, { recursive: true });
 
-    const backupFile = path.join(ICLOUD_PATH, "terminalpulse-backup.json");
-    fs.writeFileSync(backupFile, getBackupData(), "utf-8");
+    const backupFile = path.join(ICLOUD_PATH, "terminalpulse-backup.enc");
+    fs.writeFileSync(backupFile, encryptData(getBackupData()), "utf-8");
 
-    // Keep a timestamped weekly snapshot
+    // Weekly snapshot
     const weekKey = new Date().toISOString().split("T")[0];
-    const weeklyFile = path.join(ICLOUD_PATH, `terminalpulse-backup-${weekKey}.json`);
+    const weeklyFile = path.join(ICLOUD_PATH, `terminalpulse-backup-${weekKey}.enc`);
     if (!fs.existsSync(weeklyFile)) {
-      fs.writeFileSync(weeklyFile, getBackupData(), "utf-8");
-      // Clean up old weekly backups (keep last 8)
+      fs.writeFileSync(weeklyFile, encryptData(getBackupData()), "utf-8");
+      // Clean old snapshots (keep last 8)
       const files = fs.readdirSync(ICLOUD_PATH)
-        .filter(f => f.startsWith("terminalpulse-backup-") && f.endsWith(".json"))
+        .filter(f => f.startsWith("terminalpulse-backup-") && f.endsWith(".enc"))
         .sort()
         .reverse();
       for (const old of files.slice(8)) {
@@ -46,25 +122,14 @@ function autoBackupToICloud() {
   }
 }
 
-function restoreFromICloud() {
-  try {
-    const backupFile = path.join(ICLOUD_PATH, "terminalpulse-backup.json");
-    if (!fs.existsSync(backupFile)) return null;
-    const data = JSON.parse(fs.readFileSync(backupFile, "utf-8"));
-    return data;
-  } catch {
-    return null;
-  }
-}
-
 function exportBackup() {
   const savePath = dialog.showSaveDialogSync(mainWindow, {
     title: "Export TerminalPulse Backup",
-    defaultPath: `terminalpulse-backup-${new Date().toISOString().split("T")[0]}.json`,
-    filters: [{ name: "JSON", extensions: ["json"] }],
+    defaultPath: `terminalpulse-backup-${new Date().toISOString().split("T")[0]}.enc`,
+    filters: [{ name: "Encrypted Backup", extensions: ["enc"] }],
   });
   if (savePath) {
-    fs.writeFileSync(savePath, getBackupData(), "utf-8");
+    fs.writeFileSync(savePath, encryptData(getBackupData()), "utf-8");
     return true;
   }
   return false;
@@ -73,36 +138,31 @@ function exportBackup() {
 function importBackup() {
   const filePaths = dialog.showOpenDialogSync(mainWindow, {
     title: "Import TerminalPulse Backup",
-    filters: [{ name: "JSON", extensions: ["json"] }],
+    filters: [{ name: "Encrypted Backup", extensions: ["enc"] }],
     properties: ["openFile"],
   });
   if (filePaths && filePaths[0]) {
     try {
-      const data = JSON.parse(fs.readFileSync(filePaths[0], "utf-8"));
-      // Merge: keep higher values for cumulative stats
-      const currentTotal = store.get("totalSeconds") || 0;
-      const importTotal = data.totalSeconds || 0;
-      if (importTotal > currentTotal) {
-        for (const [key, val] of Object.entries(data)) {
-          store.set(key, val);
-        }
-        return { success: true, message: `Restored ${Math.round(importTotal / 3600)}h of data` };
-      } else {
-        // Ask if they want to overwrite
-        for (const [key, val] of Object.entries(data)) {
-          store.set(key, val);
-        }
-        return { success: true, message: "Backup imported successfully" };
+      const raw = fs.readFileSync(filePaths[0], "utf-8");
+      const decrypted = decryptData(raw);
+      const data = JSON.parse(decrypted);
+      const validated = validateBackupData(data);
+      if (!validated) {
+        return { success: false, message: "Invalid or corrupted backup data" };
       }
-    } catch {
-      return { success: false, message: "Invalid backup file" };
+      for (const [key, val] of Object.entries(validated)) {
+        store.set(key, val);
+      }
+      const hours = Math.round((validated.totalSeconds || 0) / 3600);
+      return { success: true, message: `Restored ${hours}h of data` };
+    } catch (err) {
+      return { success: false, message: "Failed to decrypt — wrong machine or corrupted file" };
     }
   }
   return { success: false, message: "No file selected" };
 }
 
 function startAutoBackup() {
-  // Backup to iCloud every 5 minutes
   autoBackupToICloud();
   backupInterval = setInterval(autoBackupToICloud, 5 * 60 * 1000);
 }
@@ -114,18 +174,11 @@ const autoLauncher = new AutoLaunch({
   isHidden: true,
 });
 
-if (!store.get("autoLaunchConfigured")) {
-  autoLauncher.enable().catch((err) => console.error("Auto-launch enable failed:", err));
-  store.set("autoLaunchConfigured", true);
-}
-
 let mainWindow;
 let tray;
 let trackingInterval;
 let isTerminalActive = false;
 let sessionStart = null;
-let lastHistorySize = 0;
-let lastHistoryLine = "";
 
 // Initialize store defaults
 const defaults = {
@@ -136,7 +189,6 @@ const defaults = {
   longestStreak: 0,
   level: 1,
   xp: 0,
-  // New tracking data
   aiSeconds: 0,
   dailyAiData: {},
   toolSeconds: {},
@@ -146,7 +198,6 @@ const defaults = {
   todayCommits: 0,
   totalCommits: 0,
   dailyCommits: {},
-  recentCommands: [],
   activeTools: [],
 };
 for (const [key, val] of Object.entries(defaults)) {
@@ -157,16 +208,13 @@ function getTodayKey() {
   return new Date().toISOString().split("T")[0];
 }
 
-// ─── DETECTION: Active terminal app ───
+// ─── FIX #1: All exec() replaced with execFile() — no shell injection ───
+
 function checkTerminalActive() {
   return new Promise((resolve) => {
-    const script = `
-      tell application "System Events"
-        set frontApp to name of first application process whose frontmost is true
-      end tell
-      return frontApp
-    `;
-    exec(`osascript -e '${script}'`, (err, stdout) => {
+    const script =
+      'tell application "System Events" to set frontApp to name of first application process whose frontmost is true\nreturn frontApp';
+    execFile("osascript", ["-e", script], (err, stdout) => {
       if (err) return resolve(false);
       const activeApp = stdout.trim().toLowerCase();
       const terminals = ["terminal", "iterm2", "iterm", "hyper", "alacritty", "kitty", "warp", "wezterm", "tabby"];
@@ -175,10 +223,10 @@ function checkTerminalActive() {
   });
 }
 
-// ─── DETECTION: AI tools running (claude, aider, copilot, etc.) ───
+// ─── FIX #7: ps aux replaced with ps -eo command= (no user info leaked) ───
 function detectAITools() {
   return new Promise((resolve) => {
-    exec("ps aux", (err, stdout) => {
+    execFile("ps", ["-eo", "command="], (err, stdout) => {
       if (err) return resolve({ isAI: false, tools: [] });
       const lines = stdout.split("\n");
       const aiTools = [
@@ -200,10 +248,9 @@ function detectAITools() {
   });
 }
 
-// ─── DETECTION: Running dev tools ───
 function detectDevTools() {
   return new Promise((resolve) => {
-    exec("ps aux", (err, stdout) => {
+    execFile("ps", ["-eo", "command="], (err, stdout) => {
       if (err) return resolve([]);
       const lines = stdout.toLowerCase();
       const tools = [
@@ -230,50 +277,36 @@ function detectDevTools() {
   });
 }
 
-// ─── DETECTION: Current working directory from terminal ───
+// ─── FIX #9: Safer project detection — no shell interpolation ───
 function detectCurrentProject() {
   return new Promise((resolve) => {
-    // Get the frontmost terminal's working directory via lsof
-    exec(
-      `lsof -p $(ps aux | grep -E '[T]erminal|[i]Term|[W]arp|[A]lacritty|[K]itty' | head -1 | awk '{print $2}') 2>/dev/null | grep cwd | awk '{print $NF}'`,
-      (err, stdout) => {
-        if (err || !stdout.trim()) {
-          // Fallback: try AppleScript to get terminal window title
-          const script = `
-            tell application "System Events"
-              set frontApp to name of first application process whose frontmost is true
-              if frontApp contains "Terminal" then
-                tell application "Terminal" to return name of front window
-              else if frontApp contains "iTerm" then
-                tell application "iTerm" to return name of current session of current window
-              end if
-            end tell
-          `;
-          exec(`osascript -e '${script}'`, (err2, stdout2) => {
-            if (err2 || !stdout2.trim()) return resolve(null);
-            // Extract directory from title like "user@host: /path/to/project"
-            const title = stdout2.trim();
-            const match = title.match(/[~\/][^\s]*/);
-            if (match) {
-              let dir = match[0].replace("~", os.homedir());
-              // Try to find git root
-              resolve(getProjectName(dir));
-            } else {
-              resolve(null);
-            }
-          });
-          return;
-        }
-        resolve(getProjectName(stdout.trim()));
+    const script = [
+      'tell application "System Events"',
+      '  set frontApp to name of first application process whose frontmost is true',
+      '  if frontApp contains "Terminal" then',
+      '    tell application "Terminal" to return name of front window',
+      '  else if frontApp contains "iTerm" then',
+      '    tell application "iTerm" to return name of current session of current window',
+      '  end if',
+      'end tell',
+    ].join("\n");
+    execFile("osascript", ["-e", script], (err, stdout) => {
+      if (err || !stdout.trim()) return resolve(null);
+      const title = stdout.trim();
+      const match = title.match(/[~\/][^\s]*/);
+      if (match) {
+        let dir = match[0].replace("~", os.homedir());
+        resolve(getProjectName(dir));
+      } else {
+        resolve(null);
       }
-    );
+    });
   });
 }
 
 function getProjectName(dirPath) {
   if (!dirPath) return null;
   try {
-    // Walk up to find .git directory
     let dir = dirPath;
     for (let i = 0; i < 10; i++) {
       if (fs.existsSync(path.join(dir, ".git"))) {
@@ -283,58 +316,49 @@ function getProjectName(dirPath) {
       if (parent === dir) break;
       dir = parent;
     }
-    // No git repo found, use deepest meaningful directory
     return path.basename(dirPath);
   } catch {
     return path.basename(dirPath);
   }
 }
 
-// ─── DETECTION: Shell history for recent commands ───
-function getRecentCommands() {
-  try {
-    const histFile = path.join(os.homedir(), ".zsh_history");
-    if (!fs.existsSync(histFile)) return [];
-    const stat = fs.statSync(histFile);
-    const content = fs.readFileSync(histFile, "utf-8");
-    const lines = content.split("\n").filter((l) => l.trim());
-    // Get last 20 commands, strip zsh timestamp format
-    return lines
-      .slice(-20)
-      .map((l) => l.replace(/^:\s*\d+:\d+;/, "").trim())
-      .filter((l) => l.length > 0 && l.length < 200);
-  } catch {
-    return [];
-  }
-}
+// ─── FIX #2: Shell history tracking completely removed ───
+// (was a privacy risk — commands often contain secrets)
 
-// ─── DETECTION: Git commits today ───
+// ─── FIX #9: Git commit counting — safe, no shell interpolation ───
 function countTodayCommits() {
   return new Promise((resolve) => {
-    // Find all git repos in common locations and count today's commits
     const today = getTodayKey();
-    exec(
-      `find ${os.homedir()}/Documents ${os.homedir()}/Projects ${os.homedir()}/Desktop ${os.homedir()}/dev -maxdepth 3 -name ".git" -type d 2>/dev/null`,
-      (err, stdout) => {
-        if (err || !stdout.trim()) return resolve(0);
-        const gitDirs = stdout.trim().split("\n").filter(Boolean);
-        let totalCommits = 0;
-        let pending = gitDirs.length;
-        if (pending === 0) return resolve(0);
+    const searchDirs = [
+      path.join(os.homedir(), "Documents"),
+      path.join(os.homedir(), "Projects"),
+      path.join(os.homedir(), "Desktop"),
+      path.join(os.homedir(), "dev"),
+    ].filter(d => fs.existsSync(d));
 
-        for (const gitDir of gitDirs) {
-          const repoDir = path.dirname(gitDir);
-          exec(
-            `cd "${repoDir}" && git log --oneline --since="${today}" --author="$(git config user.name)" 2>/dev/null | wc -l`,
-            (err2, stdout2) => {
-              if (!err2) totalCommits += parseInt(stdout2.trim()) || 0;
-              pending--;
-              if (pending === 0) resolve(totalCommits);
-            }
-          );
-        }
+    if (searchDirs.length === 0) return resolve(0);
+
+    execFile("find", [...searchDirs, "-maxdepth", "3", "-name", ".git", "-type", "d"], (err, stdout) => {
+      if (err || !stdout.trim()) return resolve(0);
+      const gitDirs = stdout.trim().split("\n").filter(Boolean);
+      let totalCommits = 0;
+      let pending = gitDirs.length;
+      if (pending === 0) return resolve(0);
+
+      for (const gitDir of gitDirs) {
+        const repoDir = path.dirname(gitDir);
+        // Get user name safely first, then count commits
+        execFile("git", ["-C", repoDir, "config", "user.name"], (err1, userName) => {
+          const author = (userName || "").trim();
+          if (!author) { pending--; if (pending === 0) resolve(totalCommits); return; }
+          execFile("git", ["-C", repoDir, "log", "--oneline", `--since=${today}`, `--author=${author}`], (err2, stdout2) => {
+            if (!err2) totalCommits += stdout2.trim().split("\n").filter(Boolean).length;
+            pending--;
+            if (pending === 0) resolve(totalCommits);
+          });
+        });
       }
-    );
+    });
   });
 }
 
@@ -420,7 +444,6 @@ const ACHIEVEMENT_DEFS = [
   { id: "level_5", title: "Leveling Up", desc: "Reach level 5", icon: "🎮", req: (s) => s.level >= 5 },
   { id: "level_10", title: "Double Digits", desc: "Reach level 10", icon: "🎯", req: (s) => s.level >= 10 },
   { id: "level_25", title: "Quarter Century", desc: "Reach level 25", icon: "👑", req: (s) => s.level >= 25 },
-  // New AI & productivity achievements
   { id: "ai_first", title: "AI Apprentice", desc: "First minute with an AI coding tool", icon: "🤖", req: (s) => s.aiSeconds >= 60 },
   { id: "ai_one_hour", title: "Pair Programmer", desc: "1 hour of AI-assisted coding", icon: "🧠", req: (s) => s.aiSeconds >= 3600 },
   { id: "ai_ten_hours", title: "AI Whisperer", desc: "10 hours of AI-assisted coding", icon: "🔮", req: (s) => s.aiSeconds >= 36000 },
@@ -466,45 +489,32 @@ async function trackLoop() {
   }
 
   if (isTerminalActive) {
-    // Core time tracking
     const total = store.get("totalSeconds") + 1;
     store.set("totalSeconds", total);
     updateDailyData(1);
 
-    // AI detection (every tick)
     const aiResult = await detectAITools();
-    if (aiResult.isAI) {
-      updateAIData(1);
-    }
+    if (aiResult.isAI) updateAIData(1);
     store.set("activeTools", aiResult.tools);
 
-    // Dev tools detection (every 5 seconds to reduce CPU)
     if (total % 5 === 0) {
       const devTools = await detectDevTools();
       if (devTools.length > 0) updateToolData(devTools, 5);
     }
 
-    // Project detection (every 10 seconds)
     if (total % 10 === 0) {
       const project = await detectCurrentProject();
       if (project) updateProjectData(project, 10);
     }
 
-    // Git commits (every 60 seconds)
     if (total % 60 === 0) {
       const commits = await countTodayCommits();
       const key = getTodayKey();
       const dailyCommits = store.get("dailyCommits") || {};
       dailyCommits[key] = commits;
       store.set("dailyCommits", dailyCommits);
-      // Update total commits
       const totalCommits = Object.values(dailyCommits).reduce((a, b) => a + b, 0);
       store.set("totalCommits", totalCommits);
-    }
-
-    // Recent commands (every 10 seconds)
-    if (total % 10 === 0) {
-      store.set("recentCommands", getRecentCommands());
     }
 
     calculateStreak();
@@ -525,26 +535,18 @@ function getStats() {
   const dailyAi = store.get("dailyAiData") || {};
   const todayKey = getTodayKey();
   const projSecs = store.get("projectSeconds") || {};
-  const dailyProj = store.get("dailyProjectData") || {};
   const toolSecs = store.get("toolSeconds") || {};
   const dailyCommits = store.get("dailyCommits") || {};
 
-  // Last 7 days
   const last7 = [];
   for (let i = 6; i >= 0; i--) {
     const d = new Date();
     d.setDate(d.getDate() - i);
     const key = d.toISOString().split("T")[0];
     const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    last7.push({
-      day: dayNames[d.getDay()],
-      date: key,
-      seconds: daily[key] || 0,
-      aiSeconds: dailyAi[key] || 0,
-    });
+    last7.push({ day: dayNames[d.getDay()], date: key, seconds: daily[key] || 0, aiSeconds: dailyAi[key] || 0 });
   }
 
-  // Heatmap (90 days)
   const heatmap = [];
   for (let i = 89; i >= 0; i--) {
     const d = new Date();
@@ -552,24 +554,6 @@ function getStats() {
     const key = d.toISOString().split("T")[0];
     heatmap.push({ date: key, seconds: daily[key] || 0 });
   }
-
-  // Top projects (sorted by time)
-  const topProjects = Object.entries(projSecs)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 6)
-    .map(([name, secs]) => ({ name, seconds: secs }));
-
-  // Today's projects
-  const todayProjects = Object.entries(dailyProj[todayKey] || {})
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([name, secs]) => ({ name, seconds: secs }));
-
-  // Top tools (sorted by time)
-  const topTools = Object.entries(toolSecs)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8)
-    .map(([name, secs]) => ({ name, seconds: secs }));
 
   return {
     totalSeconds: store.get("totalSeconds"),
@@ -581,25 +565,14 @@ function getStats() {
     xpToNext: 1000 - (store.get("xp") % 1000),
     xpProgress: (store.get("xp") % 1000) / 1000,
     isActive: isTerminalActive,
-    // AI data
     aiSeconds: store.get("aiSeconds") || 0,
     todayAiSeconds: dailyAi[todayKey] || 0,
     activeTools: store.get("activeTools") || [],
-    // Projects
-    topProjects,
-    todayProjects,
     projectCount: Object.keys(projSecs).length,
-    // Tools
-    topTools,
-    // Git
     todayCommits: dailyCommits[todayKey] || 0,
     totalCommits: store.get("totalCommits") || 0,
-    // Recent commands
-    recentCommands: store.get("recentCommands") || [],
-    // Charts
     last7,
     heatmap,
-    // Achievements
     achievements: store.get("achievements") || [],
     achievementDefs: ACHIEVEMENT_DEFS.map(({ id, title, desc, icon }) => ({ id, title, desc, icon })),
   };
@@ -633,6 +606,7 @@ async function createTray() {
   tray = new Tray(icon.resize({ width: 16, height: 16 }));
   tray.setToolTip("TerminalPulse");
 
+  // ─── FIX #10: Check auto-launch status, don't force enable ───
   const isEnabled = await autoLauncher.isEnabled().catch(() => false);
   const contextMenu = Menu.buildFromTemplate([
     { label: "Open TerminalPulse", click: () => (mainWindow ? mainWindow.show() : createWindow()) },
@@ -672,15 +646,8 @@ function saveAndCleanup() {
     isTerminalActive = false;
     sessionStart = null;
   }
-  if (trackingInterval) {
-    clearInterval(trackingInterval);
-    trackingInterval = null;
-  }
-  if (backupInterval) {
-    clearInterval(backupInterval);
-    backupInterval = null;
-  }
-  // Final backup before quitting
+  if (trackingInterval) { clearInterval(trackingInterval); trackingInterval = null; }
+  if (backupInterval) { clearInterval(backupInterval); backupInterval = null; }
   autoBackupToICloud();
 }
 
@@ -691,16 +658,23 @@ app.whenReady().then(() => {
   trackLoop();
   startAutoBackup();
 
-  powerMonitor.on("shutdown", () => {
-    saveAndCleanup();
-    app.quit();
-  });
-  powerMonitor.on("suspend", () => {
-    if (isTerminalActive) {
-      isTerminalActive = false;
-      sessionStart = null;
+  // ─── FIX #10: Ask before enabling auto-launch on first run ───
+  if (!store.get("autoLaunchConfigured")) {
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: "question",
+      buttons: ["Yes", "No"],
+      defaultId: 0,
+      title: "TerminalPulse",
+      message: "Would you like TerminalPulse to start automatically when you log in?",
+    });
+    if (choice === 0) {
+      autoLauncher.enable().catch(() => {});
     }
-  });
+    store.set("autoLaunchConfigured", true);
+  }
+
+  powerMonitor.on("shutdown", () => { saveAndCleanup(); app.quit(); });
+  powerMonitor.on("suspend", () => { if (isTerminalActive) { isTerminalActive = false; sessionStart = null; } });
   powerMonitor.on("resume", () => {});
 });
 
@@ -710,7 +684,7 @@ ipcMain.handle("import-backup", () => importBackup());
 ipcMain.handle("get-backup-status", () => {
   const icloudBase = path.join(os.homedir(), "Library/Mobile Documents/com~apple~CloudDocs");
   const icloudEnabled = fs.existsSync(icloudBase);
-  const backupFile = path.join(ICLOUD_PATH, "terminalpulse-backup.json");
+  const backupFile = path.join(ICLOUD_PATH, "terminalpulse-backup.enc");
   const lastBackup = fs.existsSync(backupFile) ? fs.statSync(backupFile).mtime.toISOString() : null;
   return { icloudEnabled, lastBackup };
 });

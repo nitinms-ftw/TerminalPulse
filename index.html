@@ -3,9 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- FIX #12: Strict Content Security Policy — no external resources -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:;">
   <title>TerminalPulse</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+    /* FIX #12: Removed Google Fonts — using system fonts only */
 
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -28,7 +30,7 @@
     }
 
     body {
-      font-family: 'Inter', -apple-system, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
       background: var(--bg);
       color: var(--text);
       -webkit-app-region: drag;
@@ -53,7 +55,7 @@
     /* Header */
     .header { text-align: center; margin-bottom: 24px; }
     .header h1 {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
       font-size: 20px;
       font-weight: 800;
       background: linear-gradient(135deg, var(--accent), var(--pink), var(--cyan));
@@ -141,7 +143,7 @@
       position: relative;
     }
     .timer-value {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
       font-size: 48px;
       font-weight: 800;
       letter-spacing: -2px;
@@ -192,7 +194,7 @@
       background: linear-gradient(135deg, var(--accent), #9f7cfc);
       display: flex; align-items: center; justify-content: center;
       font-size: 14px; font-weight: 800;
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
       box-shadow: 0 0 16px var(--accent-glow);
     }
     .level-info .level-title { font-size: 14px; font-weight: 700; }
@@ -223,7 +225,7 @@
     .stat-card:hover { transform: translateY(-2px); border-color: var(--accent); }
     .stat-icon { font-size: 16px; margin-bottom: 4px; }
     .stat-value {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
       font-size: 18px;
       font-weight: 700;
     }
@@ -332,7 +334,7 @@
       box-shadow: 0 0 12px var(--green-glow);
     }
     .bar-label { font-size: 10px; color: var(--text-dim); font-weight: 600; }
-    .bar-time { font-size: 9px; font-family: 'JetBrains Mono', monospace; color: var(--text-dim); }
+    .bar-time { font-size: 9px; font-family: 'SF Mono', 'Menlo', 'Monaco', monospace; color: var(--text-dim); }
 
     /* Heatmap */
     .heatmap-grid {
@@ -374,7 +376,7 @@
       transition: width 0.6s ease;
     }
     .project-time {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
       font-size: 11px; color: var(--text-dim);
       flex-shrink: 0;
     }
@@ -392,13 +394,13 @@
       display: flex; align-items: center; gap: 5px;
     }
     .tool-chip .tool-time {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
       font-size: 10px; color: var(--text-dim);
     }
 
     /* Recent Commands */
     .cmd-list {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
       font-size: 11px;
       max-height: 140px;
       overflow-y: auto;
@@ -687,7 +689,17 @@
       return h > 0 ? `${h}h` : `${m}m`;
     }
 
-    const projectColors = ["#7c5cfc","#34d399","#f472b6","#22d3ee","#fb923c","#fbbf24","#f87171","#a78bfa"];
+    // ─── FIX #6: Safe DOM helpers — no innerHTML, no XSS ───
+    function el(tag, cls, text) {
+      const e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text !== undefined) e.textContent = text;
+      return e;
+    }
+    function clearAppend(parent, children) {
+      parent.textContent = "";
+      for (const c of children) parent.appendChild(c);
+    }
 
     function updateUI(stats) {
       // Status
@@ -744,30 +756,35 @@
       document.getElementById("split-ai-label").textContent = `🤖 ${aiPct}% AI-assisted`;
       document.getElementById("split-manual-label").textContent = `⌨️ ${manualPct}% Manual`;
 
-      // Weekly chart (stacked AI + manual)
+      // Weekly chart — safe DOM creation
       const chart = document.getElementById("bar-chart");
       const maxSec = Math.max(...stats.last7.map(d => d.seconds), 60);
       const todayKey = new Date().toISOString().split("T")[0];
-      chart.innerHTML = stats.last7.map(d => {
+      const barCols = stats.last7.map(d => {
         const totalPct = Math.max((d.seconds / maxSec) * 100, 3);
         const aiH = d.seconds > 0 ? (d.aiSeconds / d.seconds) * totalPct : 0;
         const manH = totalPct - aiH;
         const isToday = d.date === todayKey;
-        return `
-          <div class="bar-col">
-            <div class="bar-time">${shortDur(d.seconds)}</div>
-            <div class="bar-stack ${isToday ? 'today-bar' : ''}" style="height: ${totalPct}%">
-              <div class="bar-segment-ai" style="height: ${aiH > 0 ? (aiH/totalPct*100) : 0}%"></div>
-              <div class="bar-segment-manual" style="height: ${manH > 0 ? (manH/totalPct*100) : 0}%"></div>
-            </div>
-            <div class="bar-label">${d.day}</div>
-          </div>`;
-      }).join("");
+        const col = el("div", "bar-col");
+        col.appendChild(el("div", "bar-time", shortDur(d.seconds)));
+        const stack = el("div", `bar-stack ${isToday ? "today-bar" : ""}`);
+        stack.style.height = `${totalPct}%`;
+        const aiSeg = el("div", "bar-segment-ai");
+        aiSeg.style.height = `${aiH > 0 ? (aiH/totalPct*100) : 0}%`;
+        const manSeg = el("div", "bar-segment-manual");
+        manSeg.style.height = `${manH > 0 ? (manH/totalPct*100) : 0}%`;
+        stack.appendChild(aiSeg);
+        stack.appendChild(manSeg);
+        col.appendChild(stack);
+        col.appendChild(el("div", "bar-label", d.day));
+        return col;
+      });
+      clearAppend(chart, barCols);
 
-      // Heatmap
+      // Heatmap — safe DOM creation
       const heatmap = document.getElementById("heatmap");
       const maxHeat = Math.max(...stats.heatmap.map(d => d.seconds), 1);
-      heatmap.innerHTML = stats.heatmap.map(d => {
+      const heatCells = stats.heatmap.map(d => {
         const intensity = d.seconds / maxHeat;
         let level = "";
         if (d.seconds === 0) level = "";
@@ -776,22 +793,25 @@
         else if (intensity < 0.6) level = "l3";
         else if (intensity < 0.8) level = "l4";
         else level = "l5";
-        return `<div class="heatmap-cell ${level}" title="${d.date}: ${dur(d.seconds)}"></div>`;
-      }).join("");
+        const cell = el("div", `heatmap-cell ${level}`);
+        cell.title = `${d.date}: ${dur(d.seconds)}`;
+        return cell;
+      });
+      clearAppend(heatmap, heatCells);
 
-      // Achievements
+      // Achievements — safe DOM creation
       const achGrid = document.getElementById("achievements");
-      achGrid.innerHTML = stats.achievementDefs.map(a => {
+      const achCards = stats.achievementDefs.map(a => {
         const unlocked = stats.achievements.includes(a.id);
-        return `
-          <div class="achievement ${unlocked ? "unlocked" : "locked"}">
-            <div class="achievement-icon">${a.icon}</div>
-            <div class="achievement-info">
-              <div class="achievement-title">${a.title}</div>
-              <div class="achievement-desc">${a.desc}</div>
-            </div>
-          </div>`;
-      }).join("");
+        const card = el("div", `achievement ${unlocked ? "unlocked" : "locked"}`);
+        card.appendChild(el("div", "achievement-icon", a.icon));
+        const info = el("div", "achievement-info");
+        info.appendChild(el("div", "achievement-title", a.title));
+        info.appendChild(el("div", "achievement-desc", a.desc));
+        card.appendChild(info);
+        return card;
+      });
+      clearAppend(achGrid, achCards);
     }
 
     function showToast(ach) {
