@@ -1,0 +1,27 @@
+{
+  "name": "terminal-pulse",
+  "version": "1.0.0",
+  "description": "Track your terminal time like a boss",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --mac",
+    "build:app": "electron-builder --mac --dir"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "dependencies": {
+    "auto-launch": "^5.0.6",
+    "electron-store": "^8.1.0"
+  },
+  "build": {
+    "appId": "com.nitinms.terminalpulse",
+    "productName": "TerminalPulse",
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "icon.png"
+    }
+  }
+}
