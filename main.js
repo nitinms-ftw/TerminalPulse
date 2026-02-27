@@ -68,6 +68,7 @@ const ALLOWED_STORE_KEYS = new Set([
   "level", "xp", "aiSeconds", "dailyAiData", "toolSeconds", "dailyToolData",
   "projectSeconds", "dailyProjectData", "todayCommits", "totalCommits",
   "dailyCommits", "activeTools", "autoLaunchConfigured", "migrationDone",
+  "sessions", "bestSessionSeconds",
 ]);
 
 function validateBackupData(data) {
@@ -188,6 +189,7 @@ const defaults = {
   longestStreak: 0, level: 1, xp: 0, aiSeconds: 0, dailyAiData: {},
   toolSeconds: {}, dailyToolData: {}, projectSeconds: {}, dailyProjectData: {},
   todayCommits: 0, totalCommits: 0, dailyCommits: {}, activeTools: [],
+  sessions: {}, bestSessionSeconds: 0,
 };
 for (const [key, val] of Object.entries(defaults)) {
   if (store.get(key) === undefined) store.set(key, val);
@@ -285,6 +287,49 @@ let idleUpdateInterval;
 let isTerminalActive = false;
 let sessionStart = null;
 let lastDateKey = null; // Edge case #3: Track date changes
+
+// ─── SESSIONS ───
+const SESSION_END_IDLE_SECONDS = 15 * 60; // 15 minutes idle → end session
+let currentSession = null; // { startTime, seconds, aiSeconds, tools: Set }
+let consecutiveIdleSeconds = 0; // how long the user has been continuously idle
+
+function startNewSession() {
+  currentSession = {
+    startTime: new Date().toISOString(),
+    seconds: 0,
+    aiSeconds: 0,
+    tools: new Set(),
+  };
+  consecutiveIdleSeconds = 0;
+}
+
+function endCurrentSession() {
+  if (!currentSession || currentSession.seconds < 10) {
+    // Don't save sessions shorter than 10 seconds
+    currentSession = null;
+    return;
+  }
+  const key = getTodayKey();
+  const sessions = store.get("sessions") || {};
+  if (!sessions[key]) sessions[key] = [];
+  sessions[key].push({
+    startTime: currentSession.startTime,
+    endTime: new Date().toISOString(),
+    seconds: currentSession.seconds,
+    aiSeconds: currentSession.aiSeconds,
+    tools: [...currentSession.tools],
+  });
+  store.set("sessions", sessions);
+
+  // Update best session
+  const bestSession = store.get("bestSessionSeconds") || 0;
+  if (currentSession.seconds > bestSession) {
+    store.set("bestSessionSeconds", currentSession.seconds);
+  }
+
+  currentSession = null;
+  consecutiveIdleSeconds = 0;
+}
 
 function getTodayKey() {
   // Use local date, not UTC — so the day matches the user's timezone
@@ -604,6 +649,7 @@ async function trackLoop() {
     const currentDate = getTodayKey();
     if (lastDateKey && lastDateKey !== currentDate) {
       console.log(`Date changed: ${lastDateKey} → ${currentDate}`);
+      endCurrentSession(); // End session at midnight
       calculateStreak();
       autoBackupToICloud();
     }
@@ -613,17 +659,28 @@ async function trackLoop() {
     const idleSeconds = await getSystemIdleSeconds();
     const isUserActive = idleSeconds < IDLE_THRESHOLD_SECONDS;
 
-    // Terminal must be in foreground AND user must be active (keyboard/mouse within last 60s)
+    // Terminal must be running AND user must be active (keyboard/mouse within last 2 min)
     const shouldTrack = active && isUserActive;
-
-
 
     if (shouldTrack && !isTerminalActive) {
       isTerminalActive = true;
       sessionStart = Date.now();
+      consecutiveIdleSeconds = 0;
+      // Start a new session if none exists
+      if (!currentSession) startNewSession();
     } else if (!shouldTrack && isTerminalActive) {
       isTerminalActive = false;
       sessionStart = null;
+    }
+
+    // Track consecutive idle time for session ending (15 min)
+    if (!isUserActive || !active) {
+      consecutiveIdleSeconds++;
+      if (currentSession && consecutiveIdleSeconds >= SESSION_END_IDLE_SECONDS) {
+        endCurrentSession();
+      }
+    } else {
+      consecutiveIdleSeconds = 0;
     }
 
     if (isTerminalActive) {
@@ -632,8 +689,19 @@ async function trackLoop() {
       updateDailyData(1);
 
       const aiResult = await detectAITools();
-      if (aiResult.isAI) updateAIData(1);
+      if (aiResult.isAI) {
+        updateAIData(1);
+        if (currentSession) currentSession.aiSeconds++;
+      }
       store.set("activeTools", aiResult.tools);
+
+      // Update current session
+      if (currentSession) {
+        currentSession.seconds++;
+        if (aiResult.tools.length > 0) {
+          for (const t of aiResult.tools) currentSession.tools.add(t);
+        }
+      }
 
       if (total % 5 === 0) {
         const devTools = await detectDevTools();
@@ -686,6 +754,7 @@ function getStats() {
   const todayKey = getTodayKey();
   const projSecs = store.get("projectSeconds") || {};
   const dailyCommits = store.get("dailyCommits") || {};
+  const sessions = store.get("sessions") || {};
 
   const last7 = [];
   for (let i = 6; i >= 0; i--) {
@@ -724,6 +793,23 @@ function getStats() {
     achievements: store.get("achievements") || [],
     achievementDefs: ACHIEVEMENT_DEFS.map(({ id, title, desc, icon }) => ({ id, title, desc, icon })),
     idleThreshold: IDLE_THRESHOLD_SECONDS,
+    // Sessions
+    currentSessionSeconds: currentSession ? currentSession.seconds : 0,
+    currentSessionAiSeconds: currentSession ? currentSession.aiSeconds : 0,
+    currentSessionTools: currentSession ? [...currentSession.tools] : [],
+    todaySessions: (sessions[todayKey] || []).length + (currentSession ? 1 : 0),
+    todaySessionList: [
+      ...(sessions[todayKey] || []),
+      ...(currentSession && currentSession.seconds >= 10 ? [{
+        startTime: currentSession.startTime,
+        endTime: null,
+        seconds: currentSession.seconds,
+        aiSeconds: currentSession.aiSeconds,
+        tools: [...currentSession.tools],
+        active: true,
+      }] : []),
+    ],
+    bestSessionSeconds: store.get("bestSessionSeconds") || 0,
   };
 }
 
@@ -787,6 +873,7 @@ async function createTray() {
 
 function saveAndCleanup() {
   if (isTerminalActive) { isTerminalActive = false; sessionStart = null; }
+  endCurrentSession(); // Save any active session
   if (trackingInterval) { clearInterval(trackingInterval); trackingInterval = null; }
   if (backupInterval) { clearInterval(backupInterval); backupInterval = null; }
   if (idleUpdateInterval) { clearInterval(idleUpdateInterval); idleUpdateInterval = null; }
@@ -827,7 +914,7 @@ app.whenReady().then(() => {
   powerMonitor.on("shutdown", () => { saveAndCleanup(); app.quit(); });
   powerMonitor.on("suspend", () => {
     if (isTerminalActive) { isTerminalActive = false; sessionStart = null; }
-    // Backup before sleep in case Mac never wakes up
+    endCurrentSession(); // End session on sleep
     autoBackupToICloud();
   });
   powerMonitor.on("resume", () => {

@@ -519,6 +519,55 @@
       transition: opacity 0.3s;
     }
 
+    /* Sessions */
+    .session-current {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      background: linear-gradient(135deg, var(--surface2), #1a1530);
+      border: 1px solid var(--accent);
+      border-radius: 10px;
+      margin-bottom: 8px;
+    }
+    .session-current .session-live {
+      display: flex; align-items: center; gap: 6px;
+    }
+    .session-live-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+      animation: pulse-green 2s ease-in-out infinite;
+    }
+    .session-live-label { font-size: 11px; font-weight: 600; color: var(--green); text-transform: uppercase; letter-spacing: 0.5px; }
+    .session-live-time {
+      font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+      font-size: 18px; font-weight: 700; color: var(--text);
+    }
+    .session-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      background: var(--surface2);
+      border-radius: 8px;
+      margin-bottom: 4px;
+    }
+    .session-item-left { display: flex; align-items: center; gap: 8px; }
+    .session-time-range { font-size: 11px; color: var(--text-dim); }
+    .session-tools { font-size: 10px; color: var(--accent); }
+    .session-duration {
+      font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+      font-size: 13px; font-weight: 600; color: var(--text);
+    }
+    .session-stats-row {
+      display: flex; justify-content: space-between;
+      font-size: 11px; color: var(--text-dim);
+      margin-bottom: 10px;
+    }
+    .session-stats-row span { font-weight: 600; }
+    .session-stats-row .best { color: var(--pink); }
+
     .empty-state {
       text-align: center;
       padding: 12px;
@@ -625,6 +674,16 @@
         <div class="stat-value" id="total-hours">0h</div>
         <div class="stat-label">All Time</div>
       </div>
+    </div>
+
+    <!-- Sessions -->
+    <div class="section">
+      <div class="section-title">🕐 Sessions</div>
+      <div class="session-stats-row">
+        <span id="session-count">0 sessions today</span>
+        <span>Best: <span class="best" id="best-session">0m</span></span>
+      </div>
+      <div id="session-list"></div>
     </div>
 
     <!-- AI vs Manual Split -->
@@ -745,6 +804,45 @@
       document.getElementById("streak").textContent = stats.currentStreak;
       document.getElementById("best-streak").textContent = stats.longestStreak;
       document.getElementById("total-hours").textContent = shortDur(stats.totalSeconds);
+
+      // Sessions
+      document.getElementById("session-count").textContent = `${stats.todaySessions} session${stats.todaySessions !== 1 ? 's' : ''} today`;
+      document.getElementById("best-session").textContent = dur(Math.max(stats.bestSessionSeconds, stats.currentSessionSeconds));
+
+      const sessionList = document.getElementById("session-list");
+      const sessionEls = [];
+      // Show sessions in reverse (newest first)
+      const allSessions = (stats.todaySessionList || []).slice().reverse();
+      for (const s of allSessions) {
+        if (s.active) {
+          // Current live session
+          const row = el("div", "session-current");
+          const left = el("div", "session-live");
+          const dot = el("div", "session-live-dot");
+          left.appendChild(dot);
+          left.appendChild(el("span", "session-live-label", "Live"));
+          row.appendChild(left);
+          row.appendChild(el("div", "session-live-time", fmt(s.seconds)));
+          sessionEls.push(row);
+        } else {
+          const row = el("div", "session-item");
+          const left = el("div", "session-item-left");
+          const start = new Date(s.startTime);
+          const end = new Date(s.endTime);
+          const timeStr = start.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) + ' – ' + end.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+          left.appendChild(el("div", "session-time-range", timeStr));
+          if (s.tools && s.tools.length > 0) {
+            left.appendChild(el("div", "session-tools", s.tools.join(", ")));
+          }
+          row.appendChild(left);
+          row.appendChild(el("div", "session-duration", dur(s.seconds)));
+          sessionEls.push(row);
+        }
+      }
+      if (sessionEls.length === 0) {
+        sessionEls.push(el("div", "empty-state", "Start a terminal session..."));
+      }
+      clearAppend(sessionList, sessionEls);
 
       // AI vs Manual split
       const aiPct = stats.totalSeconds > 0 ? Math.round((stats.aiSeconds / stats.totalSeconds) * 100) : 0;
