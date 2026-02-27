@@ -265,6 +265,25 @@ function getTodayKey() {
   return new Date().toISOString().split("T")[0];
 }
 
+// ─── IDLE DETECTION ───
+// If no keyboard/mouse input for this many seconds, pause tracking
+const IDLE_THRESHOLD_SECONDS = 60;
+
+function getSystemIdleSeconds() {
+  return new Promise((resolve) => {
+    execFile("ioreg", ["-c", "IOHIDSystem"], { timeout: 3000 }, (err, stdout) => {
+      if (err) return resolve(0);
+      const match = stdout.match(/"HIDIdleTime"\s*=\s*(\d+)/);
+      if (match) {
+        // HIDIdleTime is in nanoseconds
+        resolve(Math.floor(parseInt(match[1]) / 1000000000));
+      } else {
+        resolve(0);
+      }
+    });
+  });
+}
+
 // ─── DETECTION FUNCTIONS ───
 
 function checkTerminalActive() {
@@ -528,19 +547,22 @@ async function trackLoop() {
     const currentDate = getTodayKey();
     if (lastDateKey && lastDateKey !== currentDate) {
       console.log(`Date changed: ${lastDateKey} → ${currentDate}`);
-      // Recalculate streak for the new day
       calculateStreak();
-      // Force a backup at midnight
       autoBackupToICloud();
     }
     lastDateKey = currentDate;
 
     const active = await checkTerminalActive();
+    const idleSeconds = await getSystemIdleSeconds();
+    const isUserActive = idleSeconds < IDLE_THRESHOLD_SECONDS;
 
-    if (active && !isTerminalActive) {
+    // Terminal must be in foreground AND user must be active (keyboard/mouse within last 60s)
+    const shouldTrack = active && isUserActive;
+
+    if (shouldTrack && !isTerminalActive) {
       isTerminalActive = true;
       sessionStart = Date.now();
-    } else if (!active && isTerminalActive) {
+    } else if (!shouldTrack && isTerminalActive) {
       isTerminalActive = false;
       sessionStart = null;
     }
@@ -642,6 +664,7 @@ function getStats() {
     last7, heatmap,
     achievements: store.get("achievements") || [],
     achievementDefs: ACHIEVEMENT_DEFS.map(({ id, title, desc, icon }) => ({ id, title, desc, icon })),
+    idleThreshold: IDLE_THRESHOLD_SECONDS,
   };
 }
 
