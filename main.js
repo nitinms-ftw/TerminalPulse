@@ -94,23 +94,75 @@ function validateBackupData(data) {
   return Object.keys(clean).length > 0 ? clean : null;
 }
 
-// ─── RECOVERY: Try to restore from iCloud if store is empty ───
-// Edge case #2: Handles corruption, force quit data loss, fresh install
+// ─── RECOVERY: Always sync with iCloud backup on startup ───
+// If iCloud backup has MORE data than local store, restore it.
+// This handles: corruption, rebuilds, fresh installs, any data loss.
 function attemptRecoveryFromBackup() {
-  if ((store.get("totalSeconds") || 0) > 0) return; // Store has data, no recovery needed
+  const localTotal = store.get("totalSeconds") || 0;
 
-  // Try encrypted iCloud backup first
+  // Helper: merge backup into store if it has more data
+  function mergeIfBetter(data) {
+    const validated = validateBackupData(data);
+    if (!validated) return false;
+    const backupTotal = validated.totalSeconds || 0;
+    if (backupTotal > localTotal) {
+      // Backup has more data — merge it in
+      // For daily data, keep the max of each day
+      const mergeKeys = ["dailyData", "dailyAiData", "dailyCommits", "dailyToolData", "dailyProjectData"];
+      for (const [key, val] of Object.entries(validated)) {
+        if (mergeKeys.includes(key) && typeof val === "object") {
+          const current = store.get(key) || {};
+          for (const [dk, dv] of Object.entries(val)) {
+            if (typeof dv === "number") {
+              current[dk] = Math.max(current[dk] || 0, dv);
+            } else if (typeof dv === "object" && dv !== null) {
+              // For nested objects like dailyToolData[date][tool]
+              if (!current[dk]) current[dk] = {};
+              for (const [sk, sv] of Object.entries(dv)) {
+                current[dk][sk] = Math.max(current[dk][sk] || 0, sv);
+              }
+            }
+          }
+          store.set(key, current);
+        } else if (key === "achievements") {
+          const merged = [...new Set([...(store.get("achievements") || []), ...(val || [])])];
+          store.set("achievements", merged);
+        } else if (["toolSeconds", "projectSeconds"].includes(key) && typeof val === "object") {
+          const current = store.get(key) || {};
+          for (const [k, v] of Object.entries(val)) {
+            current[k] = Math.max(current[k] || 0, v);
+          }
+          store.set(key, current);
+        } else {
+          store.set(key, val);
+        }
+      }
+      console.log(`Recovered: local had ${localTotal}s, backup had ${backupTotal}s`);
+      return true;
+    }
+    return false;
+  }
+
+  // Try encrypted iCloud backup
   try {
     const encBackup = path.join(ICLOUD_PATH, "terminalpulse-backup.enc");
     if (fs.existsSync(encBackup)) {
-      const raw = fs.readFileSync(encBackup, "utf-8");
-      const decrypted = decryptData(raw);
-      const data = JSON.parse(decrypted);
-      const validated = validateBackupData(data);
-      if (validated && (validated.totalSeconds || 0) > 0) {
-        for (const [key, val] of Object.entries(validated)) store.set(key, val);
-        console.log("Recovered from encrypted iCloud backup");
-        return;
+      const data = JSON.parse(decryptData(fs.readFileSync(encBackup, "utf-8")));
+      if (mergeIfBetter(data)) return;
+    }
+  } catch (e) { console.log("Encrypted backup read failed:", e.message); }
+
+  // Try weekly snapshots (most recent first)
+  try {
+    if (fs.existsSync(ICLOUD_PATH)) {
+      const snapshots = fs.readdirSync(ICLOUD_PATH)
+        .filter(f => f.startsWith("terminalpulse-backup-") && f.endsWith(".enc"))
+        .sort().reverse();
+      for (const snap of snapshots) {
+        try {
+          const data = JSON.parse(decryptData(fs.readFileSync(path.join(ICLOUD_PATH, snap), "utf-8")));
+          if (mergeIfBetter(data)) return;
+        } catch {}
       }
     }
   } catch {}
@@ -120,39 +172,12 @@ function attemptRecoveryFromBackup() {
     const jsonBackup = path.join(ICLOUD_PATH, "terminalpulse-backup.json");
     if (fs.existsSync(jsonBackup)) {
       const data = JSON.parse(fs.readFileSync(jsonBackup, "utf-8"));
-      const validated = validateBackupData(data);
-      if (validated && (validated.totalSeconds || 0) > 0) {
-        for (const [key, val] of Object.entries(validated)) store.set(key, val);
-        console.log("Recovered from unencrypted iCloud backup (migration)");
-        return;
-      }
+      if (mergeIfBetter(data)) return;
     }
   } catch {}
 
-  // Try weekly snapshots (most recent first)
-  try {
-    if (fs.existsSync(ICLOUD_PATH)) {
-      const snapshots = fs.readdirSync(ICLOUD_PATH)
-        .filter(f => f.startsWith("terminalpulse-backup-") && f.endsWith(".enc"))
-        .sort()
-        .reverse();
-      for (const snap of snapshots) {
-        try {
-          const raw = fs.readFileSync(path.join(ICLOUD_PATH, snap), "utf-8");
-          const decrypted = decryptData(raw);
-          const data = JSON.parse(decrypted);
-          const validated = validateBackupData(data);
-          if (validated && (validated.totalSeconds || 0) > 0) {
-            for (const [key, val] of Object.entries(validated)) store.set(key, val);
-            console.log(`Recovered from snapshot: ${snap}`);
-            return;
-          }
-        } catch {}
-      }
-    }
-  } catch {}
-
-  console.log("No backup found to recover from — starting fresh");
+  if (localTotal === 0) console.log("No backup found — starting fresh");
+  else console.log(`Local store is current: ${localTotal}s`);
 }
 
 attemptRecoveryFromBackup();
