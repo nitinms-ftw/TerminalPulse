@@ -363,40 +363,17 @@ function getSystemIdleSeconds() {
 
 function checkTerminalActive() {
   return new Promise((resolve) => {
-    // Two-tier check:
-    // 1. Is a terminal the frontmost app? → definitely tracking
-    // 2. Is TerminalPulse frontmost BUT a terminal is running? → still track
-    //    (so checking your stats doesn't pause the clock)
+    // Only track when a terminal app is the FRONTMOST window
+    // TerminalPulse being in front does NOT count — prevents false tracking
     const script =
       'tell application "System Events" to set frontApp to name of first application process whose frontmost is true\nreturn frontApp';
     execFile("osascript", ["-e", script], { timeout: 3000 }, (err, stdout) => {
       if (err) return resolve(false);
       const activeApp = stdout.trim().toLowerCase();
+      // Exclude TerminalPulse/Electron — they contain "terminal" but aren't terminals
+      if (activeApp.includes("terminalpulse") || activeApp.includes("electron")) return resolve(false);
       const terminals = ["terminal", "iterm2", "iterm", "hyper", "alacritty", "kitty", "warp", "wezterm", "tabby"];
-
-      // If a terminal is frontmost → tracking
-      const isTerminalFront = terminals.some((t) => activeApp.includes(t))
-        && !activeApp.includes("terminalpulse");
-
-      if (isTerminalFront) return resolve(true);
-
-      // If TerminalPulse is frontmost, check if an actual terminal process is running
-      // so checking stats doesn't pause tracking
-      if (activeApp.includes("terminalpulse") || activeApp.includes("electron")) {
-        execFile("ps", ["-eo", "comm="], { timeout: 3000 }, (err2, stdout2) => {
-          if (err2) return resolve(false);
-          const procs = stdout2.split("\n").map(p => p.trim().split("/").pop().toLowerCase());
-          // Match exact process names — exclude terminalpulse/electron
-          const terminalProcs = ["terminal", "iterm2", "hyper", "alacritty", "kitty", "warp", "wezterm", "tabby"];
-          const terminalRunning = procs.some(name =>
-            terminalProcs.includes(name) && !name.includes("terminalpulse")
-          );
-          resolve(terminalRunning);
-        });
-        return;
-      }
-
-      resolve(false);
+      resolve(terminals.some((t) => activeApp.includes(t)));
     });
   });
 }
