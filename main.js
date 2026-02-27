@@ -297,7 +297,7 @@ function getTodayKey() {
 
 // ─── IDLE DETECTION ───
 // If no keyboard/mouse input for this many seconds, pause tracking
-const IDLE_THRESHOLD_SECONDS = 60;
+const IDLE_THRESHOLD_SECONDS = 120; // 2 minutes — allows reading terminal output without pausing
 
 function getSystemIdleSeconds() {
   return new Promise((resolve) => {
@@ -318,15 +318,40 @@ function getSystemIdleSeconds() {
 
 function checkTerminalActive() {
   return new Promise((resolve) => {
+    // Two-tier check:
+    // 1. Is a terminal the frontmost app? → definitely tracking
+    // 2. Is TerminalPulse frontmost BUT a terminal is running? → still track
+    //    (so checking your stats doesn't pause the clock)
     const script =
       'tell application "System Events" to set frontApp to name of first application process whose frontmost is true\nreturn frontApp';
     execFile("osascript", ["-e", script], { timeout: 3000 }, (err, stdout) => {
       if (err) return resolve(false);
       const activeApp = stdout.trim().toLowerCase();
-      // Exclude TerminalPulse itself — it contains "terminal" but isn't one
-      if (activeApp.includes("terminalpulse") || activeApp.includes("electron")) return resolve(false);
       const terminals = ["terminal", "iterm2", "iterm", "hyper", "alacritty", "kitty", "warp", "wezterm", "tabby"];
-      resolve(terminals.some((t) => activeApp.includes(t)));
+
+      // If a terminal is frontmost → tracking
+      const isTerminalFront = terminals.some((t) => activeApp.includes(t))
+        && !activeApp.includes("terminalpulse");
+
+      if (isTerminalFront) return resolve(true);
+
+      // If TerminalPulse is frontmost, check if an actual terminal process is running
+      // so checking stats doesn't pause tracking
+      if (activeApp.includes("terminalpulse") || activeApp.includes("electron")) {
+        execFile("ps", ["-eo", "comm="], { timeout: 3000 }, (err2, stdout2) => {
+          if (err2) return resolve(false);
+          const procs = stdout2.split("\n").map(p => p.trim().split("/").pop().toLowerCase());
+          // Match exact process names — exclude terminalpulse/electron
+          const terminalProcs = ["terminal", "iterm2", "hyper", "alacritty", "kitty", "warp", "wezterm", "tabby"];
+          const terminalRunning = procs.some(name =>
+            terminalProcs.includes(name) && !name.includes("terminalpulse")
+          );
+          resolve(terminalRunning);
+        });
+        return;
+      }
+
+      resolve(false);
     });
   });
 }
@@ -591,6 +616,8 @@ async function trackLoop() {
     // Terminal must be in foreground AND user must be active (keyboard/mouse within last 60s)
     const shouldTrack = active && isUserActive;
 
+
+
     if (shouldTrack && !isTerminalActive) {
       isTerminalActive = true;
       sessionStart = Date.now();
@@ -715,6 +742,11 @@ function createWindow() {
   });
   mainWindow.loadFile("index.html");
   mainWindow.on("closed", () => (mainWindow = null));
+
+  // Don't steal focus from the terminal on launch
+  mainWindow.once("ready-to-show", () => {
+    mainWindow.showInactive();
+  });
 
   // Edge case #6: Send stats as soon as window loads
   mainWindow.webContents.on("did-finish-load", () => {
