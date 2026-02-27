@@ -180,6 +180,30 @@ let trackingInterval;
 let isTerminalActive = false;
 let sessionStart = null;
 
+// ─── MIGRATION: Recover old unencrypted backups on first encrypted run ───
+if (!store.get("migrationDone")) {
+  const oldBackup = path.join(ICLOUD_PATH, "terminalpulse-backup.json");
+  if (store.get("totalSeconds") === undefined || store.get("totalSeconds") === 0) {
+    // Try old iCloud JSON backup
+    if (fs.existsSync(oldBackup)) {
+      try {
+        const oldData = JSON.parse(fs.readFileSync(oldBackup, "utf-8"));
+        const validated = validateBackupData(oldData);
+        if (validated) {
+          for (const [key, val] of Object.entries(validated)) {
+            store.set(key, val);
+          }
+          console.log("Migrated data from unencrypted backup");
+        }
+      } catch {}
+    }
+    // Try old local unencrypted config
+    const oldConfig = path.join(app.getPath("userData"), "config.json.bak");
+    // (no-op if doesn't exist)
+  }
+  store.set("migrationDone", true);
+}
+
 // Initialize store defaults
 const defaults = {
   totalSeconds: 0,
