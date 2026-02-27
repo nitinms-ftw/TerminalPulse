@@ -293,6 +293,8 @@ function checkTerminalActive() {
     execFile("osascript", ["-e", script], { timeout: 3000 }, (err, stdout) => {
       if (err) return resolve(false);
       const activeApp = stdout.trim().toLowerCase();
+      // Exclude TerminalPulse itself — it contains "terminal" but isn't one
+      if (activeApp.includes("terminalpulse") || activeApp.includes("electron")) return resolve(false);
       const terminals = ["terminal", "iterm2", "iterm", "hyper", "alacritty", "kitty", "warp", "wezterm", "tabby"];
       resolve(terminals.some((t) => activeApp.includes(t)));
     });
