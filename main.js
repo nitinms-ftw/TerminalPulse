@@ -808,7 +808,8 @@ function createWindow() {
 
   // Don't steal focus from the terminal on launch
   mainWindow.once("ready-to-show", () => {
-    mainWindow.showInactive();
+    mainWindow.show();
+    mainWindow.focus();
   });
 
   // Edge case #6: Send stats as soon as window loads

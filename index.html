@@ -342,6 +342,7 @@
       grid-template-columns: repeat(13, 1fr);
       gap: 3px;
       margin-top: 8px;
+      overflow: visible;
     }
     .heatmap-cell {
       aspect-ratio: 1; border-radius: 3px;
@@ -589,11 +590,75 @@
     .tab-btn.active {
       background: var(--accent); color: white; border-color: var(--accent);
     }
+
+    /* Hover tooltip inside cells */
+    .heatmap-cell {
+      position: relative;
+      cursor: pointer;
+    }
+    .heatmap-cell:hover {
+      filter: brightness(1.3);
+      transform: scale(1.2);
+      z-index: 10;
+      transition: all 0.15s ease;
+    }
+    .heatmap-cell .cell-tip {
+      display: none;
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 6px 12px;
+      background: #12121aee;
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--cyan);
+      white-space: nowrap;
+      pointer-events: none;
+      z-index: 100;
+      box-shadow: 0 0 12px rgba(124, 92, 252, 0.3), 0 4px 12px rgba(0, 0, 0, 0.6);
+    }
+    .heatmap-cell:hover .cell-tip {
+      display: block;
+    }
+    .bar-col {
+      position: relative;
+      cursor: pointer;
+    }
+    .bar-col:hover {
+      filter: brightness(1.15);
+    }
+    .bar-col .cell-tip {
+      display: none;
+      position: absolute;
+      top: -28px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 5px 10px;
+      background: #12121aee;
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--cyan);
+      white-space: nowrap;
+      pointer-events: none;
+      z-index: 100;
+      box-shadow: 0 0 12px rgba(124, 92, 252, 0.3), 0 4px 12px rgba(0, 0, 0, 0.6);
+    }
+    .bar-col:hover .cell-tip {
+      display: block;
+    }
   </style>
 </head>
 <body>
   <div class="drag-region"></div>
   <div class="particles" id="particles"></div>
+
 
   <div class="achievement-toast" id="toast">
     <div class="toast-icon" id="toast-icon">🏆</div>
@@ -760,6 +825,17 @@
       for (const c of children) parent.appendChild(c);
     }
 
+    // ─── Tooltip helper ───
+    function fmtHours(s) {
+      if (s < 60) return s + "s";
+      const h = s / 3600;
+      if (h < 1) return Math.round(s / 60) + " min";
+      const hrs = Math.floor(h);
+      const mins = Math.round((s % 3600) / 60);
+      if (mins === 0) return hrs === 1 ? "1 hour" : hrs + " hours";
+      return hrs + "h " + mins + "m";
+    }
+
     function updateUI(stats) {
       // Status
       const status = document.getElementById("status");
@@ -875,6 +951,10 @@
         stack.appendChild(manSeg);
         col.appendChild(stack);
         col.appendChild(el("div", "bar-label", d.day));
+        // Tooltip as child element (shown on hover via CSS)
+        let tipText = `${d.day} · ${fmtHours(d.seconds)}`;
+        if (d.aiSeconds > 0) tipText += ` | 🤖 ${fmtHours(d.aiSeconds)}`;
+        col.appendChild(el("span", "cell-tip", tipText));
         return col;
       });
       clearAppend(chart, barCols);
@@ -892,7 +972,9 @@
         else if (intensity < 0.8) level = "l4";
         else level = "l5";
         const cell = el("div", `heatmap-cell ${level}`);
-        cell.title = `${d.date}: ${dur(d.seconds)}`;
+        // Tooltip as child element (shown on hover via CSS)
+        const tipText = d.seconds > 0 ? `${d.date} · ${fmtHours(d.seconds)}` : `${d.date} · No activity`;
+        cell.appendChild(el("span", "cell-tip", tipText));
         return cell;
       });
       clearAppend(heatmap, heatCells);
