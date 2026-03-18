@@ -199,9 +199,11 @@ for (const [key, val] of Object.entries(defaults)) {
 let backupInterval;
 
 function getBackupData() {
+  // Flush memory first so backup has latest data
+  flushMemoryToStore();
   const data = {};
   for (const key of ALLOWED_STORE_KEYS) {
-    const val = store.get(key);
+    const val = memoryState[key] !== undefined ? memoryState[key] : store.get(key);
     if (val !== undefined) data[key] = val;
   }
   return JSON.stringify(data, null, 2);
@@ -269,8 +271,8 @@ function importBackup() {
 
 function startAutoBackup() {
   autoBackupToICloud();
-  // Edge case #4: Backup every 1 minute instead of 5 — less data loss on force quit
-  backupInterval = setInterval(autoBackupToICloud, 60 * 1000);
+  // Backup every 5 minutes (was 1 min — unnecessary disk + crypto work)
+  backupInterval = setInterval(autoBackupToICloud, BACKUP_INTERVAL);
 }
 
 // ─── AUTO-LAUNCH ───
@@ -287,6 +289,112 @@ let idleUpdateInterval;
 let isTerminalActive = false;
 let sessionStart = null;
 let lastDateKey = null; // Edge case #3: Track date changes
+
+// ─── ENERGY OPTIMIZATION: TRACKING INTERVALS ───
+const TRACK_INTERVAL_SECONDS = 5;      // Main loop runs every 5s instead of 1s
+const AI_CHECK_INTERVAL = 10;           // Check AI tools every 10s
+const DEV_TOOL_CHECK_INTERVAL = 30;     // Check dev tools every 30s
+const PROJECT_CHECK_INTERVAL = 60;      // Check project every 60s
+const COMMIT_CHECK_INTERVAL = 300;      // Check commits every 5 min
+const IDLE_UPDATE_INTERVAL = 30000;     // Send idle updates every 30s
+const BACKUP_INTERVAL = 300000;         // Backup every 5 min
+const STORE_FLUSH_INTERVAL = 30000;     // Flush in-memory data to disk every 30s
+
+let trackTickCounter = 0; // counts seconds of active tracking
+
+// ─── ENERGY OPTIMIZATION: IN-MEMORY ACCUMULATOR ───
+// Batch store writes instead of writing every second
+const memoryState = {
+  totalSeconds: store.get("totalSeconds") || 0,
+  aiSeconds: store.get("aiSeconds") || 0,
+  dailyData: store.get("dailyData") || {},
+  dailyAiData: store.get("dailyAiData") || {},
+  toolSeconds: store.get("toolSeconds") || {},
+  dailyToolData: store.get("dailyToolData") || {},
+  projectSeconds: store.get("projectSeconds") || {},
+  dailyProjectData: store.get("dailyProjectData") || {},
+  achievements: store.get("achievements") || [],
+  currentStreak: store.get("currentStreak") || 0,
+  longestStreak: store.get("longestStreak") || 0,
+  level: store.get("level") || 1,
+  xp: store.get("xp") || 0,
+  activeTools: store.get("activeTools") || [],
+  todayCommits: store.get("todayCommits") || 0,
+  totalCommits: store.get("totalCommits") || 0,
+  dailyCommits: store.get("dailyCommits") || {},
+  sessions: store.get("sessions") || {},
+  bestSessionSeconds: store.get("bestSessionSeconds") || 0,
+  dirty: false, // track if we need to flush
+};
+
+let storeFlushInterval;
+let cachedStats = null;
+let statsCacheDirty = true;
+
+function flushMemoryToStore() {
+  if (!memoryState.dirty) return;
+  for (const key of ALLOWED_STORE_KEYS) {
+    if (memoryState[key] !== undefined) {
+      store.set(key, memoryState[key]);
+    }
+  }
+  memoryState.dirty = false;
+  console.log("Flushed in-memory state to disk");
+}
+
+// ─── ENERGY OPTIMIZATION: COMBINED PROCESS SCAN ───
+// Single `ps` call for both AI tools and dev tools
+let cachedProcessLines = [];
+let lastProcessScanTime = 0;
+
+function scanProcesses() {
+  return new Promise((resolve) => {
+    execFile("ps", ["-eo", "command="], { timeout: 3000 }, (err, stdout) => {
+      if (err) return resolve([]);
+      cachedProcessLines = stdout.split("\n");
+      lastProcessScanTime = Date.now();
+      resolve(cachedProcessLines);
+    });
+  });
+}
+
+function detectAIToolsFromLines(lines) {
+  const aiTools = [
+    { name: "Pi (Coding Agent)", test: (line) => /\bpi\s*$/.test(line.trim()) || /\spi\s+--/.test(line) },
+    { name: "Claude Code", test: (line) => /\bclaude\b/.test(line) && !/claudehelper/i.test(line) },
+    { name: "Aider", test: (line) => /\baider\b/.test(line) },
+    { name: "GitHub Copilot", test: (line) => /\bcopilot\b/.test(line) },
+    { name: "Cursor", test: (line) => /\bcursor\b/i.test(line) && /cursor\s/.test(line) },
+    { name: "Continue", test: (line) => /\bcontinue\b/.test(line) && /continue\s+--/.test(line) },
+  ];
+  const detected = [];
+  for (const tool of aiTools) {
+    if (lines.some((line) => tool.test(line.toLowerCase()))) detected.push(tool.name);
+  }
+  return { isAI: detected.length > 0, tools: detected };
+}
+
+function detectDevToolsFromLines(lines) {
+  const linesJoined = lines.join("\n").toLowerCase();
+  const tools = [
+    { name: "Node.js", patterns: [" node "] },
+    { name: "Python", patterns: [" python"] },
+    { name: "Docker", patterns: ["docker"] },
+    { name: "npm", patterns: [" npm "] },
+    { name: "Git", patterns: [" git "] },
+    { name: "Vim/Neovim", patterns: [" vim ", " nvim "] },
+    { name: "SSH", patterns: [" ssh "] },
+    { name: "Rust/Cargo", patterns: [" cargo "] },
+    { name: "Go", patterns: [" go build", " go run"] },
+    { name: "Ruby", patterns: [" ruby ", " rails "] },
+    { name: "Java/Gradle", patterns: [" java ", " gradle "] },
+  ];
+  const detected = [];
+  for (const tool of tools) {
+    if (tool.patterns.some((p) => linesJoined.includes(p))) detected.push(tool.name);
+  }
+  return detected;
+}
 
 // ─── SESSIONS ───
 const SESSION_END_IDLE_SECONDS = 15 * 60; // 15 minutes idle → end session
@@ -305,28 +413,25 @@ function startNewSession() {
 
 function endCurrentSession() {
   if (!currentSession || currentSession.seconds < 10) {
-    // Don't save sessions shorter than 10 seconds
     currentSession = null;
     return;
   }
   const key = getTodayKey();
-  const sessions = store.get("sessions") || {};
-  if (!sessions[key]) sessions[key] = [];
-  sessions[key].push({
+  if (!memoryState.sessions[key]) memoryState.sessions[key] = [];
+  memoryState.sessions[key].push({
     startTime: currentSession.startTime,
     endTime: new Date().toISOString(),
     seconds: currentSession.seconds,
     aiSeconds: currentSession.aiSeconds,
     tools: [...currentSession.tools],
   });
-  store.set("sessions", sessions);
 
-  // Update best session
-  const bestSession = store.get("bestSessionSeconds") || 0;
-  if (currentSession.seconds > bestSession) {
-    store.set("bestSessionSeconds", currentSession.seconds);
+  if (currentSession.seconds > memoryState.bestSessionSeconds) {
+    memoryState.bestSessionSeconds = currentSession.seconds;
   }
 
+  memoryState.dirty = true;
+  statsCacheDirty = true;
   currentSession = null;
   consecutiveIdleSeconds = 0;
 }
@@ -378,54 +483,9 @@ function checkTerminalActive() {
   });
 }
 
-function detectAITools() {
-  return new Promise((resolve) => {
-    execFile("ps", ["-eo", "command="], { timeout: 3000 }, (err, stdout) => {
-      if (err) return resolve({ isAI: false, tools: [] });
-      const lines = stdout.split("\n");
-      const aiTools = [
-        { name: "Pi (Coding Agent)", test: (line) => /\bpi\s*$/.test(line.trim()) || /\spi\s+--/.test(line) },
-        { name: "Claude Code", test: (line) => /\bclaude\b/.test(line) && !/claudehelper/i.test(line) },
-        { name: "Aider", test: (line) => /\baider\b/.test(line) },
-        { name: "GitHub Copilot", test: (line) => /\bcopilot\b/.test(line) },
-        { name: "Cursor", test: (line) => /\bcursor\b/i.test(line) && /cursor\s/.test(line) },
-        { name: "Continue", test: (line) => /\bcontinue\b/.test(line) && /continue\s+--/.test(line) },
-      ];
-      const detected = [];
-      for (const tool of aiTools) {
-        if (lines.some((line) => tool.test(line.toLowerCase()))) detected.push(tool.name);
-      }
-      resolve({ isAI: detected.length > 0, tools: detected });
-    });
-  });
-}
-
-function detectDevTools() {
-  return new Promise((resolve) => {
-    execFile("ps", ["-eo", "command="], { timeout: 3000 }, (err, stdout) => {
-      if (err) return resolve([]);
-      const lines = stdout.toLowerCase();
-      const tools = [
-        { name: "Node.js", patterns: [" node "] },
-        { name: "Python", patterns: [" python"] },
-        { name: "Docker", patterns: ["docker"] },
-        { name: "npm", patterns: [" npm "] },
-        { name: "Git", patterns: [" git "] },
-        { name: "Vim/Neovim", patterns: [" vim ", " nvim "] },
-        { name: "SSH", patterns: [" ssh "] },
-        { name: "Rust/Cargo", patterns: [" cargo "] },
-        { name: "Go", patterns: [" go build", " go run"] },
-        { name: "Ruby", patterns: [" ruby ", " rails "] },
-        { name: "Java/Gradle", patterns: [" java ", " gradle "] },
-      ];
-      const detected = [];
-      for (const tool of tools) {
-        if (tool.patterns.some((p) => lines.includes(p))) detected.push(tool.name);
-      }
-      resolve(detected);
-    });
-  });
-}
+// detectAITools and detectDevTools are now replaced by
+// detectAIToolsFromLines() and detectDevToolsFromLines() above
+// which operate on cached process lines from a single scanProcesses() call
 
 function detectCurrentProject() {
   return new Promise((resolve) => {
@@ -505,46 +565,42 @@ function countTodayCommits() {
 
 function updateDailyData(seconds) {
   const key = getTodayKey();
-  const daily = store.get("dailyData") || {};
-  daily[key] = (daily[key] || 0) + seconds;
-  store.set("dailyData", daily);
+  memoryState.dailyData[key] = (memoryState.dailyData[key] || 0) + seconds;
+  memoryState.dirty = true;
+  statsCacheDirty = true;
 }
 
 function updateAIData(seconds) {
   const key = getTodayKey();
-  store.set("aiSeconds", (store.get("aiSeconds") || 0) + seconds);
-  const dailyAi = store.get("dailyAiData") || {};
-  dailyAi[key] = (dailyAi[key] || 0) + seconds;
-  store.set("dailyAiData", dailyAi);
+  memoryState.aiSeconds += seconds;
+  memoryState.dailyAiData[key] = (memoryState.dailyAiData[key] || 0) + seconds;
+  memoryState.dirty = true;
+  statsCacheDirty = true;
 }
 
 function updateToolData(tools, seconds) {
   const key = getTodayKey();
-  const toolSecs = store.get("toolSeconds") || {};
-  const dailyTool = store.get("dailyToolData") || {};
-  if (!dailyTool[key]) dailyTool[key] = {};
+  if (!memoryState.dailyToolData[key]) memoryState.dailyToolData[key] = {};
   for (const tool of tools) {
-    toolSecs[tool] = (toolSecs[tool] || 0) + seconds;
-    dailyTool[key][tool] = (dailyTool[key][tool] || 0) + seconds;
+    memoryState.toolSeconds[tool] = (memoryState.toolSeconds[tool] || 0) + seconds;
+    memoryState.dailyToolData[key][tool] = (memoryState.dailyToolData[key][tool] || 0) + seconds;
   }
-  store.set("toolSeconds", toolSecs);
-  store.set("dailyToolData", dailyTool);
+  memoryState.dirty = true;
+  statsCacheDirty = true;
 }
 
 function updateProjectData(project, seconds) {
   if (!project) return;
   const key = getTodayKey();
-  const projSecs = store.get("projectSeconds") || {};
-  const dailyProj = store.get("dailyProjectData") || {};
-  if (!dailyProj[key]) dailyProj[key] = {};
-  projSecs[project] = (projSecs[project] || 0) + seconds;
-  dailyProj[key][project] = (dailyProj[key][project] || 0) + seconds;
-  store.set("projectSeconds", projSecs);
-  store.set("dailyProjectData", dailyProj);
+  if (!memoryState.dailyProjectData[key]) memoryState.dailyProjectData[key] = {};
+  memoryState.projectSeconds[project] = (memoryState.projectSeconds[project] || 0) + seconds;
+  memoryState.dailyProjectData[key][project] = (memoryState.dailyProjectData[key][project] || 0) + seconds;
+  memoryState.dirty = true;
+  statsCacheDirty = true;
 }
 
 function calculateStreak() {
-  const daily = store.get("dailyData") || {};
+  const daily = memoryState.dailyData;
   let streak = 0;
   const today = new Date();
   for (let i = 0; i < 365; i++) {
@@ -557,16 +613,20 @@ function calculateStreak() {
       break;
     }
   }
-  store.set("currentStreak", streak);
-  if (streak > store.get("longestStreak")) store.set("longestStreak", streak);
+  memoryState.currentStreak = streak;
+  if (streak > memoryState.longestStreak) memoryState.longestStreak = streak;
+  memoryState.dirty = true;
+  statsCacheDirty = true;
 }
 
 function calculateLevel() {
-  const totalMinutes = Math.floor(store.get("totalSeconds") / 60);
+  const totalMinutes = Math.floor(memoryState.totalSeconds / 60);
   const xp = totalMinutes * 10;
   const level = Math.floor(xp / 1000) + 1;
-  store.set("xp", xp);
-  store.set("level", level);
+  memoryState.xp = xp;
+  memoryState.level = level;
+  memoryState.dirty = true;
+  statsCacheDirty = true;
 }
 
 // ─── ACHIEVEMENTS ───
@@ -597,15 +657,14 @@ const ACHIEVEMENT_DEFS = [
 ];
 
 function checkAchievements() {
-  const unlocked = store.get("achievements") || [];
-  const projSecs = store.get("projectSeconds") || {};
+  const unlocked = [...memoryState.achievements];
   const state = {
-    totalSeconds: store.get("totalSeconds"),
-    currentStreak: store.get("currentStreak"),
-    level: store.get("level"),
-    aiSeconds: store.get("aiSeconds") || 0,
-    totalCommits: store.get("totalCommits") || 0,
-    projectCount: Object.keys(projSecs).length,
+    totalSeconds: memoryState.totalSeconds,
+    currentStreak: memoryState.currentStreak,
+    level: memoryState.level,
+    aiSeconds: memoryState.aiSeconds,
+    totalCommits: memoryState.totalCommits,
+    projectCount: Object.keys(memoryState.projectSeconds).length,
   };
   const newlyUnlocked = [];
   for (const ach of ACHIEVEMENT_DEFS) {
@@ -614,7 +673,9 @@ function checkAchievements() {
       newlyUnlocked.push(ach);
     }
   }
-  store.set("achievements", unlocked);
+  memoryState.achievements = unlocked;
+  memoryState.dirty = true;
+  statsCacheDirty = true;
   return newlyUnlocked;
 }
 
@@ -626,8 +687,9 @@ async function trackLoop() {
     const currentDate = getTodayKey();
     if (lastDateKey && lastDateKey !== currentDate) {
       console.log(`Date changed: ${lastDateKey} → ${currentDate}`);
-      endCurrentSession(); // End session at midnight
+      endCurrentSession();
       calculateStreak();
+      flushMemoryToStore();
       autoBackupToICloud();
     }
     lastDateKey = currentDate;
@@ -643,7 +705,6 @@ async function trackLoop() {
       isTerminalActive = true;
       sessionStart = Date.now();
       consecutiveIdleSeconds = 0;
-      // Start a new session if none exists
       if (!currentSession) startNewSession();
     } else if (!shouldTrack && isTerminalActive) {
       isTerminalActive = false;
@@ -651,8 +712,9 @@ async function trackLoop() {
     }
 
     // Track consecutive idle time for session ending (15 min)
+    // Scale by TRACK_INTERVAL_SECONDS since loop runs every N seconds
     if (!isUserActive || !active) {
-      consecutiveIdleSeconds++;
+      consecutiveIdleSeconds += TRACK_INTERVAL_SECONDS;
       if (currentSession && consecutiveIdleSeconds >= SESSION_END_IDLE_SECONDS) {
         endCurrentSession();
       }
@@ -661,60 +723,70 @@ async function trackLoop() {
     }
 
     if (isTerminalActive) {
-      const total = store.get("totalSeconds") + 1;
-      store.set("totalSeconds", total);
-      updateDailyData(1);
+      // Add TRACK_INTERVAL_SECONDS instead of 1
+      memoryState.totalSeconds += TRACK_INTERVAL_SECONDS;
+      updateDailyData(TRACK_INTERVAL_SECONDS);
+      trackTickCounter += TRACK_INTERVAL_SECONDS;
 
-      const aiResult = await detectAITools();
-      if (aiResult.isAI) {
-        updateAIData(1);
-        if (currentSession) currentSession.aiSeconds++;
-      }
-      store.set("activeTools", aiResult.tools);
+      // AI tools: check every AI_CHECK_INTERVAL seconds via single process scan
+      if (trackTickCounter % AI_CHECK_INTERVAL < TRACK_INTERVAL_SECONDS) {
+        const lines = await scanProcesses();
+        const aiResult = detectAIToolsFromLines(lines);
+        if (aiResult.isAI) {
+          updateAIData(AI_CHECK_INTERVAL);
+          if (currentSession) currentSession.aiSeconds += AI_CHECK_INTERVAL;
+        }
+        memoryState.activeTools = aiResult.tools;
+        statsCacheDirty = true;
 
-      // Update current session
-      if (currentSession) {
-        currentSession.seconds++;
-        if (aiResult.tools.length > 0) {
-          for (const t of aiResult.tools) currentSession.tools.add(t);
+        // Dev tools: check every DEV_TOOL_CHECK_INTERVAL (reuse same process lines)
+        if (trackTickCounter % DEV_TOOL_CHECK_INTERVAL < TRACK_INTERVAL_SECONDS) {
+          const devTools = detectDevToolsFromLines(lines);
+          if (devTools.length > 0) updateToolData(devTools, DEV_TOOL_CHECK_INTERVAL);
         }
       }
 
-      if (total % 5 === 0) {
-        const devTools = await detectDevTools();
-        if (devTools.length > 0) updateToolData(devTools, 5);
+      // Update current session
+      if (currentSession) {
+        currentSession.seconds += TRACK_INTERVAL_SECONDS;
+        if (memoryState.activeTools.length > 0) {
+          for (const t of memoryState.activeTools) currentSession.tools.add(t);
+        }
       }
 
-      if (total % 10 === 0) {
+      // Project detection: every PROJECT_CHECK_INTERVAL
+      if (trackTickCounter % PROJECT_CHECK_INTERVAL < TRACK_INTERVAL_SECONDS) {
         const project = await detectCurrentProject();
-        if (project) updateProjectData(project, 10);
+        if (project) updateProjectData(project, PROJECT_CHECK_INTERVAL);
       }
 
-      if (total % 60 === 0) {
+      // Commit counting: every COMMIT_CHECK_INTERVAL (5 min)
+      if (trackTickCounter % COMMIT_CHECK_INTERVAL < TRACK_INTERVAL_SECONDS) {
         const commits = await countTodayCommits();
         const key = getTodayKey();
-        const dailyCommits = store.get("dailyCommits") || {};
-        dailyCommits[key] = commits;
-        store.set("dailyCommits", dailyCommits);
-        store.set("totalCommits", Object.values(dailyCommits).reduce((a, b) => a + b, 0));
+        memoryState.dailyCommits[key] = commits;
+        memoryState.totalCommits = Object.values(memoryState.dailyCommits).reduce((a, b) => a + b, 0);
+        memoryState.dirty = true;
+        statsCacheDirty = true;
       }
 
-      calculateStreak();
-      calculateLevel();
+      // Streak + level: only recalculate every 60s
+      if (trackTickCounter % 60 < TRACK_INTERVAL_SECONDS) {
+        calculateStreak();
+        calculateLevel();
+      }
+
       const newAchievements = checkAchievements();
 
       sendToRenderer("update", getStats());
       for (const ach of newAchievements) sendToRenderer("achievement-unlocked", ach);
     }
-
-    // Edge case #6: Always send stats to renderer even when idle (every 5s)
-    // So the UI always shows correct data on restart
   } catch (err) {
     console.error("Track loop error:", err.message);
   }
 }
 
-// Edge case #6: Send updates even when idle so UI is always current
+// Edge case #6: Send updates when idle so UI is always current (every 30s)
 function idleUpdate() {
   sendToRenderer("update", getStats());
 }
@@ -725,13 +797,24 @@ function sendToRenderer(channel, data) {
   }
 }
 
+// Cached achievement defs — never changes at runtime
+const ACHIEVEMENT_DEFS_SERIALIZED = ACHIEVEMENT_DEFS.map(({ id, title, desc, icon }) => ({ id, title, desc, icon }));
+
 function getStats() {
-  const daily = store.get("dailyData") || {};
-  const dailyAi = store.get("dailyAiData") || {};
+  // Return cached stats if nothing changed (saves array rebuilds)
+  if (cachedStats && !statsCacheDirty) {
+    // Only update volatile fields
+    cachedStats.isActive = isTerminalActive;
+    cachedStats.currentSessionSeconds = currentSession ? currentSession.seconds : 0;
+    cachedStats.currentSessionAiSeconds = currentSession ? currentSession.aiSeconds : 0;
+    cachedStats.currentSessionTools = currentSession ? [...currentSession.tools] : [];
+    return cachedStats;
+  }
+
+  const daily = memoryState.dailyData;
+  const dailyAi = memoryState.dailyAiData;
   const todayKey = getTodayKey();
-  const projSecs = store.get("projectSeconds") || {};
-  const dailyCommits = store.get("dailyCommits") || {};
-  const sessions = store.get("sessions") || {};
+  const sessions = memoryState.sessions;
 
   const last7 = [];
   for (let i = 6; i >= 0; i--) {
@@ -750,27 +833,26 @@ function getStats() {
     heatmap.push({ date: key, seconds: daily[key] || 0 });
   }
 
-  return {
-    totalSeconds: store.get("totalSeconds"),
+  cachedStats = {
+    totalSeconds: memoryState.totalSeconds,
     todaySeconds: daily[todayKey] || 0,
-    currentStreak: store.get("currentStreak"),
-    longestStreak: store.get("longestStreak"),
-    level: store.get("level"),
-    xp: store.get("xp"),
-    xpToNext: 1000 - (store.get("xp") % 1000),
-    xpProgress: (store.get("xp") % 1000) / 1000,
+    currentStreak: memoryState.currentStreak,
+    longestStreak: memoryState.longestStreak,
+    level: memoryState.level,
+    xp: memoryState.xp,
+    xpToNext: 1000 - (memoryState.xp % 1000),
+    xpProgress: (memoryState.xp % 1000) / 1000,
     isActive: isTerminalActive,
-    aiSeconds: store.get("aiSeconds") || 0,
+    aiSeconds: memoryState.aiSeconds,
     todayAiSeconds: dailyAi[todayKey] || 0,
-    activeTools: store.get("activeTools") || [],
-    projectCount: Object.keys(projSecs).length,
-    todayCommits: dailyCommits[todayKey] || 0,
-    totalCommits: store.get("totalCommits") || 0,
+    activeTools: memoryState.activeTools,
+    projectCount: Object.keys(memoryState.projectSeconds).length,
+    todayCommits: memoryState.dailyCommits[todayKey] || 0,
+    totalCommits: memoryState.totalCommits,
     last7, heatmap,
-    achievements: store.get("achievements") || [],
-    achievementDefs: ACHIEVEMENT_DEFS.map(({ id, title, desc, icon }) => ({ id, title, desc, icon })),
+    achievements: memoryState.achievements,
+    achievementDefs: ACHIEVEMENT_DEFS_SERIALIZED,
     idleThreshold: IDLE_THRESHOLD_SECONDS,
-    // Sessions
     currentSessionSeconds: currentSession ? currentSession.seconds : 0,
     currentSessionAiSeconds: currentSession ? currentSession.aiSeconds : 0,
     currentSessionTools: currentSession ? [...currentSession.tools] : [],
@@ -786,8 +868,10 @@ function getStats() {
         active: true,
       }] : []),
     ],
-    bestSessionSeconds: store.get("bestSessionSeconds") || 0,
+    bestSessionSeconds: memoryState.bestSessionSeconds,
   };
+  statsCacheDirty = false;
+  return cachedStats;
 }
 
 // ─── WINDOW & TRAY ───
@@ -851,10 +935,12 @@ async function createTray() {
 
 function saveAndCleanup() {
   if (isTerminalActive) { isTerminalActive = false; sessionStart = null; }
-  endCurrentSession(); // Save any active session
+  endCurrentSession();
   if (trackingInterval) { clearInterval(trackingInterval); trackingInterval = null; }
   if (backupInterval) { clearInterval(backupInterval); backupInterval = null; }
   if (idleUpdateInterval) { clearInterval(idleUpdateInterval); idleUpdateInterval = null; }
+  if (storeFlushInterval) { clearInterval(storeFlushInterval); storeFlushInterval = null; }
+  flushMemoryToStore(); // Ensure all in-memory data is persisted
   autoBackupToICloud();
 }
 
@@ -867,14 +953,17 @@ app.whenReady().then(() => {
   createWindow();
   createTray();
 
-  // Main 1-second tracking loop
-  trackingInterval = setInterval(trackLoop, 1000);
+  // Main tracking loop — every 5 seconds instead of 1 (5x fewer process spawns)
+  trackingInterval = setInterval(trackLoop, TRACK_INTERVAL_SECONDS * 1000);
   trackLoop();
 
-  // Edge case #6: Send UI updates every 5s even when idle
-  idleUpdateInterval = setInterval(idleUpdate, 5000);
+  // Send UI updates every 30s when idle (was 5s)
+  idleUpdateInterval = setInterval(idleUpdate, IDLE_UPDATE_INTERVAL);
 
-  // Edge case #4: Backup every 1 minute
+  // Flush in-memory state to disk every 30s (batches 6+ store.set() calls into 1 write)
+  storeFlushInterval = setInterval(flushMemoryToStore, STORE_FLUSH_INTERVAL);
+
+  // Backup every 5 minutes (was 1 min)
   startAutoBackup();
 
   // Auto-launch consent
@@ -892,7 +981,8 @@ app.whenReady().then(() => {
   powerMonitor.on("shutdown", () => { saveAndCleanup(); app.quit(); });
   powerMonitor.on("suspend", () => {
     if (isTerminalActive) { isTerminalActive = false; sessionStart = null; }
-    endCurrentSession(); // End session on sleep
+    endCurrentSession();
+    flushMemoryToStore(); // Persist before sleep
     autoBackupToICloud();
   });
   powerMonitor.on("resume", () => {
