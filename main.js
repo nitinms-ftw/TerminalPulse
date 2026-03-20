@@ -163,10 +163,10 @@ function attemptRecoveryFromBackup() {
         try {
           const data = JSON.parse(decryptData(fs.readFileSync(path.join(ICLOUD_PATH, snap), "utf-8")));
           if (mergeIfBetter(data)) return;
-        } catch {}
+        } catch (e) { console.log(`Snapshot ${snap} read failed:`, e.message); }
       }
     }
-  } catch {}
+  } catch (e) { console.log("Weekly snapshot scan failed:", e.message); }
 
   // Try old unencrypted JSON backup (migration)
   try {
@@ -175,7 +175,7 @@ function attemptRecoveryFromBackup() {
       const data = JSON.parse(fs.readFileSync(jsonBackup, "utf-8"));
       if (mergeIfBetter(data)) return;
     }
-  } catch {}
+  } catch (e) { console.log("JSON backup read failed:", e.message); }
 
   if (localTotal === 0) console.log("No backup found — starting fresh");
   else console.log(`Local store is current: ${localTotal}s`);
@@ -436,13 +436,19 @@ function endCurrentSession() {
   consecutiveIdleSeconds = 0;
 }
 
-function getTodayKey() {
-  // Use local date, not UTC — so the day matches the user's timezone
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
+function localDateKey(date) {
+  // Always use local date, not UTC — so the day matches the user's timezone
+  // This is the SINGLE source of truth for date key formatting.
+  // Using toISOString().split("T")[0] gives UTC which breaks near midnight.
+  const d = date || new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function getTodayKey() {
+  return localDateKey(new Date());
 }
 
 // ─── IDLE DETECTION ───
@@ -606,7 +612,7 @@ function calculateStreak() {
   for (let i = 0; i < 365; i++) {
     const d = new Date(today);
     d.setDate(d.getDate() - i);
-    const key = d.toISOString().split("T")[0];
+    const key = localDateKey(d);
     if (daily[key] && daily[key] >= 60) {
       streak++;
     } else if (i > 0) {
@@ -820,7 +826,7 @@ function getStats() {
   for (let i = 6; i >= 0; i--) {
     const d = new Date();
     d.setDate(d.getDate() - i);
-    const key = d.toISOString().split("T")[0];
+    const key = localDateKey(d);
     const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     last7.push({ day: dayNames[d.getDay()], date: key, seconds: daily[key] || 0, aiSeconds: dailyAi[key] || 0 });
   }
@@ -829,7 +835,7 @@ function getStats() {
   for (let i = 89; i >= 0; i--) {
     const d = new Date();
     d.setDate(d.getDate() - i);
-    const key = d.toISOString().split("T")[0];
+    const key = localDateKey(d);
     heatmap.push({ date: key, seconds: daily[key] || 0 });
   }
 
